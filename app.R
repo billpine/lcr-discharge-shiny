@@ -1,21 +1,24 @@
 # Little Colorado River Discharge Data - USGS Water Data API version
-# Hosting-ready revision, November 2026. Original layout retained.
-# Requires: shiny, dataRetrieval, ggplot2, plotly, dplyr, lubridate, purrr
+# Rim-readable revision, November 2026.
+# Requires: shiny, dataRetrieval, ggplot2, plotly, dplyr, lubridate, purrr, scales
 # USGS parameter 00060 = discharge (cfs); daily statistic 00003 = mean.
 #
-# Changes from the October version:
-#  1. Date window is recomputed on every pull. Before, date_window() had no
-#     reactive dependencies, so it was computed once per session and
-#     "Refresh" re-requested the same frozen window.
-#  2. Auto-refresh every 15 min, aligned to the clock (:00, :15, :30, :45).
-#  3. Results cached across viewers with bindCache(): 10 colleagues watching
-#     still means one USGS request per 15 min, not ten.
-#  4. Status line on the page: time of last pull and any USGS errors
-#     (hosted, nobody sees the RStudio console).
-#  5. Table leads with the latest instantaneous reading, its age, and a
-#     text status flag (OK / STALE / NO DATA) so gage outages are obvious.
-#  6. Okabe-Ito colors plus distinct line types; Gage Pool in solid black.
-#  7. Provisional-data banner.
+# What this app does: shows observed USGS discharge. It does NOT forecast.
+#
+# Page layout, top to bottom:
+#  1. Gage Pool headline: flow now, trend, and where it sits against the crew
+#     levels (no crossing above 600 cfs; alert above 3,000 cfs).
+#  2. Upstream watch: one line naming any gage that is rising.
+#  3. Gage table in flow order (Winslow, Moenkopi, Cameron, Gage Pool):
+#     now, trend, 24-h peak, yesterday's average, last reading, reporting.
+#  4. Plots: continuous (with crew levels marked) and daily mean.
+#
+# Background (unchanged from the previous revision):
+#  - Auto-refresh every 15 min, clock-aligned, one USGS pull shared by all
+#    viewers via bindCache(); "Refresh now" forces a new pull.
+#  - USGS errors shown on the page via purrr::safely().
+#  - Okabe-Ito colors plus line types; Gage Pool solid black.
+#  - API key read from API_USGS_PAT in .Renviron (never in this file).
 
 library(shiny)
 library(dataRetrieval)
@@ -26,29 +29,51 @@ library(lubridate)
 library(purrr)
 
 # ---- Settings -------------------------------------------------------------
-refresh_minutes <- 15   # auto-refresh interval
-days_back       <- 10   # plotting window
-stale_hours     <- 3    # flag a gage if its latest reading is older than this
+refresh_minutes <- 15     # auto-refresh interval
+days_back       <- 10     # plotting window
+stale_hours     <- 3      # "Gage reporting: Delayed" if last reading older
+trend_hours     <- 3      # trend = now vs. this many hours ago
+trend_pct       <- 0.10   # change must exceed 10% ...
+trend_min_cfs   <- 20     # ... and 20 cfs to count as Rising/Falling
+no_cross_cfs    <- 600    # crew level at Gage Pool: extreme caution crossing at camps
+alert_cfs       <- 3000   # crew level at Gage Pool: alert
 
-# ---- Gages, colors, line types ------------------------------------------
+# ---- Gages (flow order), colors, line types -------------------------------
+# Moenkopi Wash joins above the Cameron gage, so Cameron is the only gaged
+# input to the Gage Pool.
 gages <- data.frame(
   monitoring_location_id = paste0(
-    "USGS-", c("09400350", "09402000", "09401260", "09402300")
+    "USGS-", c("09400350", "09401260", "09402000", "09402300")
   ),
-  Site = c("Winslow", "Cameron", "Moenkopi", "LCR Gage Pool"),
+  Site = c("Winslow", "Moenkopi", "Cameron", "LCR Gage Pool"),
   stringsAsFactors = FALSE
 )
 
 # Okabe-Ito. Gage Pool is black and solid so it reads as the reference line.
-site_colors <- setNames(c("#E69F00", "#56B4E9", "#009E73", "#000000"),
-                        gages$Site)
-site_lines  <- setNames(c("dashed", "dotdash", "longdash", "solid"),
-                        gages$Site)
+site_colors <- c("Winslow" = "#E69F00", "Moenkopi" = "#009E73",
+                 "Cameron" = "#56B4E9", "LCR Gage Pool" = "#000000")
+site_lines  <- c("Winslow" = "dashed", "Moenkopi" = "longdash",
+                 "Cameron" = "dotdash", "LCR Gage Pool" = "solid")
+site_shapes <- c("Winslow" = 16, "Moenkopi" = 15,
+                 "Cameron" = 17, "LCR Gage Pool" = 18)
 
 lcr_scales <- list(
   scale_color_manual(values = site_colors, name = "Gage site"),
   scale_linetype_manual(values = site_lines, name = "Gage site"),
   theme_minimal(base_size = 13)
+)
+
+# Crew levels drawn on the continuous plot. Labels sit at the left edge
+# (x_min) because ggplotly does not place text at x = -Inf.
+crew_lines <- function(x_min) list(
+  geom_hline(yintercept = c(no_cross_cfs, alert_cfs),
+             linetype = "dotted", colour = "grey40"),
+  annotate("text", x = x_min, y = c(no_cross_cfs, alert_cfs),
+           label = c(sprintf("Gage Pool %s: no crossing",
+                             scales::comma(no_cross_cfs)),
+                     sprintf("Gage Pool %s: crew alert",
+                             scales::comma(alert_cfs))),
+           hjust = 0, vjust = -0.4, size = 3, colour = "grey30")
 )
 
 # ggplotly labels legend entries "(Winslow,Winslow)" when color and linetype
@@ -62,6 +87,7 @@ clean_legend <- function(p) {
 }
 
 site_factor <- function(x) factor(x, levels = gages$Site)
+fmt_cfs <- function(x) ifelse(is.na(x), "-", scales::comma(round(x)))
 
 # ---- Empty templates ------------------------------------------------------
 empty_daily <- function() {
@@ -121,10 +147,49 @@ fetch_continuous <- function(start_date, end_time) {
     dplyr::arrange(.data$Site, .data$dateTime)
 }
 
-# safely() returns list(result, error) instead of throwing, so one failed
-# request does not take down the other, and the error can be shown on page.
 safe_daily      <- purrr::safely(fetch_daily,      otherwise = empty_daily())
 safe_continuous <- purrr::safely(fetch_continuous, otherwise = empty_continuous())
+
+# ---- Per-gage summary -----------------------------------------------------
+trend_label <- function(now, before) {
+  thresh <- pmax(trend_min_cfs, trend_pct * before)
+  dplyr::case_when(
+    is.na(now) | is.na(before) ~ "-",
+    now - before > thresh      ~ "Rising",
+    before - now > thresh      ~ "Falling",
+    TRUE                       ~ "Steady"
+  )
+}
+
+# Reading closest to trend_hours before the latest one; NA if the nearest
+# reading is more than an hour off (gap in the record).
+value_hours_before <- function(t, q, hours) {
+  target <- as.numeric(max(t)) - hours * 3600
+  gap    <- abs(as.numeric(t) - target)
+  if (min(gap) > 3600) NA_real_ else q[which.min(gap)]
+}
+
+site_summary <- function(continuous, pulled) {
+  if (nrow(continuous) == 0L) {
+    return(data.frame(Site = site_factor(character()),
+                      last_time = as.POSIXct(character(), tz = "US/Arizona"),
+                      now_cfs = numeric(), before_cfs = numeric(),
+                      peak24_cfs = numeric(), hours_old = numeric(),
+                      trend = character()))
+  }
+  continuous %>%
+    group_by(Site) %>%
+    summarise(
+      last_time  = max(dateTime),
+      now_cfs    = Discharge[which.max(dateTime)],
+      before_cfs = value_hours_before(dateTime, Discharge, trend_hours),
+      peak24_cfs = max(Discharge[as.numeric(dateTime) >
+                                   as.numeric(max(dateTime)) - 24 * 3600]),
+      .groups = "drop"
+    ) %>%
+    mutate(hours_old = as.numeric(difftime(pulled, last_time, units = "hours")),
+           trend     = trend_label(now_cfs, before_cfs))
+}
 
 # ---- UI -------------------------------------------------------------------
 ui <- fluidPage(
@@ -132,27 +197,44 @@ ui <- fluidPage(
     .provisional { background:#F0E442; color:#000; padding:8px 12px;
                    margin-bottom:12px; font-weight:bold; }
     .usgs-error  { color:#D55E00; }
+    .headline    { border:2px solid #000; padding:12px 16px; margin-bottom:10px; }
+    .headline-main { font-size:1.6em; font-weight:bold; }
+    .headline-level { font-size:1.15em; font-weight:bold; margin-top:4px; }
+    .headline-sub  { color:#444; margin-top:4px; }
+    .upstream    { font-size:1.15em; margin-bottom:16px; }
   "))),
-  titlePanel("Little Colorado River Discharge Data"),
+  titlePanel("Little Colorado River Discharge"),
   tags$div(class = "provisional",
-           "PROVISIONAL USGS DATA, subject to revision. For situational ",
-           "awareness only; this page is not a validated flood forecast."),
+           "PROVISIONAL USGS DATA, subject to revision. Observed flows only; ",
+           "this page does not forecast when or whether a flood will arrive."),
   sidebarLayout(
     sidebarPanel(
       uiOutput("status"),
       actionButton("refresh", "Refresh now"),
       tags$hr(),
-      tags$p("Data: USGS Water Data APIs (parameter 00060)."),
-      tags$p("Times shown in Arizona time (MST, no daylight saving)."),
-      tags$p(sprintf("STALE = latest reading older than %d hours.",
-                     stale_hours))
+      tags$p(tags$strong("Crew levels at the Gage Pool:"),
+             sprintf("caution when crossing at camps above %s cfs; alert above %s cfs.",
+                     scales::comma(no_cross_cfs), scales::comma(alert_cfs))),
+      tags$p(sprintf(paste0("Trend compares the latest reading with %d hours ",
+                            "earlier. Rising or Falling means a change of ",
+                            "more than %d%% and %d cfs."),
+                     trend_hours, round(100 * trend_pct), trend_min_cfs)),
+      tags$p(sprintf(paste0("Gage reporting: Yes = reading within %d h; ",
+                            "Delayed = older; No = nothing in %d days. ",
+                            "A gage that is not reporting can hide a flood."),
+                     stale_hours, days_back)),
+      tags$p("Flood path: Winslow, then Moenkopi Wash joins, then Cameron, ",
+             "then the Gage Pool."),
+      tags$p("Times are Arizona time (MST). Data: USGS Water Data APIs.")
     ),
     mainPanel(
-      h3("Current Conditions"),
-      tableOutput("latestValues"),
-      h3("Continuous (Instantaneous) Discharge"),
+      uiOutput("gpHeadline"),
+      uiOutput("upstreamWatch"),
+      h3("Gages, upstream to downstream"),
+      tableOutput("gageTable"),
+      h3(sprintf("Continuous discharge, last %d days", days_back)),
       plotlyOutput("hourlyDischargePlot"),
-      h3("Daily Mean Discharge"),
+      h3(sprintf("Daily mean discharge, last %d days", days_back)),
       plotlyOutput("dischargePlot")
     )
   )
@@ -161,8 +243,7 @@ ui <- fluidPage(
 # ---- Server ---------------------------------------------------------------
 server <- function(input, output, session) {
 
-  # Clock-aligned refresh bucket. invalidateLater fires just after the next
-  # boundary, so plots redraw once per interval rather than every minute.
+  # Clock-aligned refresh bucket; fires just after the next boundary.
   bucket <- reactive({
     step <- refresh_minutes * 60
     now  <- as.numeric(Sys.time())
@@ -170,8 +251,7 @@ server <- function(input, output, session) {
     floor(now / step)
   })
 
-  # One pull per bucket, shared by every viewer of the app (app-level cache).
-  # Clicking "Refresh now" changes the key and forces a fresh pull.
+  # One pull per bucket, shared by all viewers. "Refresh now" forces a pull.
   usgs <- reactive({
     end_time   <- Sys.time()
     end_date   <- as.Date(end_time, tz = "US/Arizona")
@@ -186,6 +266,7 @@ server <- function(input, output, session) {
 
   daily_data      <- reactive(usgs()$daily$result)
   continuous_data <- reactive(usgs()$continuous$result)
+  summ            <- reactive(site_summary(continuous_data(), usgs()$pulled))
 
   output$status <- renderUI({
     d <- usgs()
@@ -203,49 +284,98 @@ server <- function(input, output, session) {
     )
   })
 
-  output$latestValues <- renderTable({
-    daily      <- daily_data()
-    continuous <- continuous_data()
-    pulled     <- usgs()$pulled
+  # ---- Gage Pool headline ----
+  output$gpHeadline <- renderUI({
+    gp <- dplyr::filter(summ(), Site == "LCR Gage Pool")
 
-    validate(need(nrow(daily) > 0L || nrow(continuous) > 0L,
+    if (nrow(gp) == 0L) {
+      return(tags$div(class = "headline",
+        tags$div(class = "headline-main", "Gage Pool: NOT REPORTING"),
+        tags$div(class = "headline-sub",
+                 "No recent Gage Pool readings. Check upstream gages below.")))
+    }
+
+    trend_txt <- if (gp$trend == "-") "trend unknown" else tolower(gp$trend)
+    level_txt <- dplyr::case_when(
+      gp$now_cfs >= alert_cfs ~
+        sprintf("ABOVE %s cfs CREW ALERT LEVEL.", scales::comma(alert_cfs)),
+      gp$now_cfs >  no_cross_cfs ~
+        sprintf("Above %s cfs: no crossing at camps.",
+                scales::comma(no_cross_cfs)),
+      TRUE ~
+        sprintf("Below the %s cfs no-crossing level.",
+                scales::comma(no_cross_cfs))
+    )
+    delayed <- if (gp$hours_old > stale_hours) " READING IS DELAYED." else ""
+
+    tags$div(class = "headline",
+      tags$div(class = "headline-main",
+               sprintf("Gage Pool: %s cfs, %s", fmt_cfs(gp$now_cfs), trend_txt)),
+      tags$div(class = "headline-level", level_txt),
+      tags$div(class = "headline-sub",
+               sprintf("Reading at %s (%.1f h ago). Peak in last 24 h: %s cfs.%s",
+                       format(gp$last_time, "%a %b %d %H:%M"), gp$hours_old,
+                       fmt_cfs(gp$peak24_cfs), delayed)))
+  })
+
+  # ---- One-line upstream watch ----
+  output$upstreamWatch <- renderUI({
+    up <- summ() %>%
+      dplyr::filter(Site != "LCR Gage Pool") %>%
+      dplyr::arrange(Site)
+    rising <- up %>%
+      dplyr::filter(trend == "Rising") %>%
+      dplyr::mutate(txt = sprintf("%s (%s cfs)", Site, fmt_cfs(now_cfs))) %>%
+      dplyr::pull(txt)
+    quiet <- setdiff(gages$Site[gages$Site != "LCR Gage Pool"],
+                     as.character(up$Site[up$hours_old <= stale_hours]))
+
+    tags$div(class = "upstream",
+      tags$strong("Upstream: "),
+      if (length(rising) > 0L) {
+        paste0("RISING at ", paste(rising, collapse = ", "), ".")
+      } else {
+        "nothing rising."
+      },
+      if (length(quiet) > 0L) {
+        paste0(" Not reporting or delayed: ", paste(quiet, collapse = ", "), ".")
+      })
+  })
+
+  # ---- Gage table ----
+  output$gageTable <- renderTable({
+    s     <- summ()
+    daily <- daily_data()
+
+    validate(need(nrow(s) > 0L || nrow(daily) > 0L,
                   "No USGS discharge data were returned. See status at left."))
 
-    latest_cont <- continuous %>%
-      group_by(Site) %>%
-      slice_max(dateTime, n = 1, with_ties = FALSE) %>%
-      ungroup() %>%
-      transmute(Site,
-                Latest_cfs   = Discharge,
-                Reading_time = format(dateTime, "%b %d %H:%M",
-                                      tz = "US/Arizona"),
-                Hours_old    = as.numeric(difftime(pulled, dateTime,
-                                                   units = "hours")))
-
-    max_cont <- continuous %>%
-      group_by(Site) %>%
-      summarise(Max_10day_cfs = max(Discharge), .groups = "drop")
-
-    latest_daily <- daily %>%
+    yesterday <- daily %>%
       group_by(Site) %>%
       slice_max(Date, n = 1, with_ties = FALSE) %>%
       ungroup() %>%
-      transmute(Site,
-                Daily_mean_cfs  = Discharge,
-                Daily_mean_date = format(Date, "%b %d"))
+      transmute(Site, daily_cfs = Discharge)
 
     data.frame(Site = site_factor(gages$Site)) %>%
-      left_join(latest_cont,  by = "Site") %>%
-      left_join(max_cont,     by = "Site") %>%
-      left_join(latest_daily, by = "Site") %>%
-      mutate(Status = case_when(is.na(Hours_old)        ~ "NO DATA",
-                                Hours_old > stale_hours ~ "STALE",
-                                TRUE                    ~ "OK"),
-             Hours_old = round(Hours_old, 1)) %>%
-      select(Site, Status, Latest_cfs, Reading_time, Hours_old,
-             Max_10day_cfs, Daily_mean_cfs, Daily_mean_date)
-  }, digits = 1, na = "-")
+      left_join(s,         by = "Site") %>%
+      left_join(yesterday, by = "Site") %>%
+      transmute(
+        `Gage`                      = as.character(Site),
+        `Now (cfs)`                 = fmt_cfs(now_cfs),
+        `Trend`                     = dplyr::coalesce(trend, "-"),
+        `Peak, last 24 h (cfs)`     = fmt_cfs(peak24_cfs),
+        `Yesterday's average (cfs)` = fmt_cfs(daily_cfs),
+        `Last reading`              = ifelse(is.na(last_time), "-",
+                                             format(last_time, "%a %H:%M",
+                                                    tz = "US/Arizona")),
+        `Gage reporting`            = dplyr::case_when(
+          is.na(hours_old)        ~ "No",
+          hours_old > stale_hours ~ "Delayed",
+          TRUE                    ~ "Yes")
+      )
+  }, align = "lrlrrll")
 
+  # ---- Plots ----
   output$hourlyDischargePlot <- renderPlotly({
     continuous <- continuous_data()
     validate(need(nrow(continuous) > 0L,
@@ -254,9 +384,9 @@ server <- function(input, output, session) {
     p <- ggplot(continuous,
                 aes(x = dateTime, y = Discharge,
                     color = Site, linetype = Site)) +
+      crew_lines(min(continuous$dateTime)) +
       geom_line(linewidth = 1) +
-      labs(title = sprintf("Continuous discharge, last %d days", days_back),
-           x = "Date and time (Arizona MST)", y = "Discharge (cfs)") +
+      labs(x = "Date and time (Arizona MST)", y = "Discharge (cfs)") +
       scale_x_datetime(date_labels = "%b %d %H:%M", timezone = "US/Arizona") +
       lcr_scales
     ggplotly(p) %>% clean_legend()
@@ -272,11 +402,9 @@ server <- function(input, output, session) {
                     color = Site, linetype = Site, shape = Site)) +
       geom_line(linewidth = 1) +
       geom_point(size = 2.5) +
-      labs(title = sprintf("Daily mean discharge, last %d days", days_back),
-           x = "Date", y = "Discharge (cfs)") +
+      labs(x = "Date", y = "Discharge (cfs)") +
       scale_x_date(date_breaks = "1 day", date_labels = "%b %d") +
-      scale_shape_manual(values = setNames(c(16, 17, 15, 18), gages$Site),
-                         name = "Gage site") +
+      scale_shape_manual(values = site_shapes, name = "Gage site") +
       lcr_scales
     ggplotly(p) %>% clean_legend()
   })
