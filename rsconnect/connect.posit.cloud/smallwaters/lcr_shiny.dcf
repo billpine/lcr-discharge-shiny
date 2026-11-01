@@ -1,0 +1,10 @@
+name: lcr_shiny
+title: LCR_Shiny
+username: smallwaters
+account: smallwaters
+server: connect.posit.cloud
+hostUrl: https://api.connect.posit.cloud/v1
+appId: 01a17531-e945-cb9c-e1c8-7056fc12c810
+bundleId:
+url: https://connect.posit.cloud/smallwaters/content/01a17531-e945-cb9c-e1c8-7056fc12c810
+version: 1
