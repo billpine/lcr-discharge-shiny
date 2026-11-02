@@ -17,8 +17,15 @@
 #     Same logic as 14_live_forecast.R; shown only when Cameron has a flood;
 #     collapses to one line once the forecast window has passed.
 #  4. "About this forecast": static, collapsed methods note and disclaimer.
-#  5. Gauge table, upstream to downstream.
+#  5. Gauge table, upstream to downstream. Moenkopi Wash is a tributary that
+#     joins the LCR below Cameron, so it sits between Cameron and the Gauge
+#     Pool and its floods are NOT covered by the Cameron forecast.
 #  6. Plots: continuous (with crew levels) and daily mean.
+#
+# 11/2/2026: a second Cameron pulse on the falling limb of an earlier flood
+# (2,715 cfs at 00:00, down to 607 at 09:00, back to 2,532 by 13:00) was
+# not detected. New floods are now measured from the low AFTER the biggest
+# peak in the window, and the rise threshold scales with flow.
 
 library(shiny)
 library(dataRetrieval)
@@ -42,11 +49,16 @@ alert_cfs       <- 3000   # crew level at Gauge Pool: alert
 # Forecast settings, matching 00_setup.R and 14_live_forecast.R
 cam_min_peak   <- 100     # peak_rules, Cameron
 cam_min_rise   <- 50      # peak_rules, Cameron
+cam_rel_rise   <- 0.10    # a rise must also be 10% of its starting low, so
+                          # recession wiggles at high flow don't count
 lookback_h     <- 48      # base flow search before the peak
 event_h        <- 48      # current Cameron flood = highest hour in last 48 h
 peaked_drop    <- 0.8     # peaked once flow < 80% of max ...
 peaked_min_h   <- 2       # ... and the max is at least 2 h old
 season_months  <- 4:10    # model fit on April-October floods
+
+# Rise needed above a low of q cfs to count as a flood
+rise_needed <- function(q) pmax(cam_min_rise, cam_rel_rise * q)
 
 tz_az <- "US/Arizona"
 
@@ -54,11 +66,12 @@ m <- readRDS("model_cam_gp.rds")
 ante_d <- if (is.null(m$ante_days)) 14 else m$ante_days
 
 # ---- Gauges (flow order), colors, line types -------------------------------
+# Winslow -> Cameron on the mainstem; Moenkopi Wash joins below Cameron.
 gauges <- data.frame(
   monitoring_location_id = paste0(
-    "USGS-", c("09400350", "09401260", "09402000", "09402300")
+    "USGS-", c("09400350", "09402000", "09401260", "09402300")
   ),
-  Site = c("Winslow", "Moenkopi", "Cameron", "LCR Gauge Pool"),
+  Site = c("Winslow", "Cameron", "Moenkopi", "LCR Gauge Pool"),
   stringsAsFactors = FALSE
 )
 
@@ -211,6 +224,49 @@ hourly <- function(continuous, site) {
     dplyr::arrange(time)
 }
 
+# Find the current Cameron flood in the event window.
+# 1. Biggest hour in the window (pk_max).
+# 2. Lowest hour AFTER it (trough): the recession low a new pulse starts from.
+#    Empty when the biggest hour is the latest hour (still rising).
+# 3. If Cameron has since risen enough above that trough, the new pulse is
+#    the flood, with the trough as its base. This covers both a second pulse
+#    on the falling limb (11/2/2026) and an old tail at the window edge
+#    masking a small new rise (11/1/2026).
+# 4. Otherwise the flood is pk_max, with base from the lookback before it.
+find_cam_flood <- function(cam, last_t) {
+  win    <- dplyr::filter(cam, time > last_t - event_h * 3600)
+  pk_max <- dplyr::slice_max(win, flow, n = 1, with_ties = FALSE)
+
+  trough <- win %>%
+    dplyr::filter(time > pk_max$time) %>%
+    dplyr::slice_min(flow, n = 1, with_ties = TRUE) %>%
+    dplyr::slice_max(time, n = 1, with_ties = FALSE)
+
+  pk_new <- if (nrow(trough) == 1L) {
+    win %>%
+      dplyr::filter(time >= trough$time) %>%
+      dplyr::slice_max(flow, n = 1, with_ties = FALSE)
+  } else win[0, ]
+
+  new_flood <- nrow(pk_new) == 1L &&
+    pk_new$flow >= cam_min_peak &&
+    pk_new$flow - trough$flow >= rise_needed(trough$flow)
+
+  pk   <- if (new_flood) pk_new else pk_max
+  base <- if (new_flood) trough else cam %>%
+    dplyr::filter(time <= pk$time, time > pk$time - lookback_h * 3600) %>%
+    dplyr::filter(flow == min(flow)) %>%
+    dplyr::slice_max(time, n = 1, with_ties = FALSE)
+
+  # Low a future rise would be measured from: the post-peak trough when
+  # there is one, else the plain recent low.
+  post_low <- nrow(trough) == 1L
+  low_ref  <- if (post_low) trough$flow else
+    min(cam$flow[cam$time > last_t - lookback_h * 3600])
+
+  list(pk = pk, base = base, low_ref = low_ref, post_low = post_low)
+}
+
 run_forecast <- function(continuous, now) {
   cam <- hourly(continuous, "Cameron")
   gp  <- hourly(continuous, "LCR Gauge Pool")
@@ -225,40 +281,19 @@ run_forecast <- function(continuous, now) {
     dplyr::slice_max(dateTime, n = 1, with_ties = FALSE) %>%
     dplyr::pull(Discharge)
 
-  win <- dplyr::filter(cam, time > last_t - event_h * 3600)
-
-  # New rise first: highest hour after the latest low in the window. This
-  # stops the receding tail of an older flood (e.g. 931 cfs at the window
-  # edge, 11/1/2026) from masking a new one.
-  trough <- win %>%
-    dplyr::filter(flow == min(flow)) %>%
-    dplyr::slice_max(time, n = 1, with_ties = FALSE)
-  pk_new <- win %>%
-    dplyr::filter(time >= trough$time) %>%
-    dplyr::slice_max(flow, n = 1, with_ties = FALSE)
-  new_flood <- pk_new$flow >= cam_min_peak &&
-    pk_new$flow - trough$flow >= cam_min_rise
-
-  # Otherwise, as before: highest hour in the window, base from the
-  # lookback before it.
-  pk <- if (new_flood) pk_new else
-    dplyr::slice_max(win, flow, n = 1, with_ties = FALSE)
-  base <- if (new_flood) trough else cam %>%
-    dplyr::filter(time <= pk$time, time > pk$time - lookback_h * 3600) %>%
-    dplyr::filter(flow == min(flow)) %>%
-    dplyr::slice_max(time, n = 1, with_ties = FALSE)
-
-  # Cameron flow that would trigger a new forecast: at least cam_min_rise
-  # above the recent low, and at least cam_min_peak.
-  low_recent <- min(cam$flow[cam$time > last_t - lookback_h * 3600])
+  ev   <- find_cam_flood(cam, last_t)
+  pk   <- ev$pk
+  base <- ev$base
 
   out <- list(cam_now = cam_now, cam_raw = cam_raw, last_t = last_t, pk = pk, now = now,
               pk_age_h    = as.numeric(difftime(now, pk$time, units = "hours")),
               clears_at   = pk$time + event_h * 3600,   # old peak leaves the search window
-              low_recent  = low_recent,
-              trigger_cfs = max(cam_min_peak, low_recent + cam_min_rise))
+              low_recent  = ev$low_ref,
+              low_is_post = ev$post_low,
+              trigger_cfs = max(cam_min_peak, ev$low_ref + rise_needed(ev$low_ref)))
 
-  has_flood <- pk$flow >= cam_min_peak && pk$flow - base$flow >= cam_min_rise
+  has_flood <- pk$flow >= cam_min_peak &&
+    pk$flow - base$flow >= rise_needed(base$flow)
   if (!has_flood) return(c(out, status = "no_flood"))
 
   out$peaked <- cam_now < peaked_drop * pk$flow &&
@@ -316,9 +351,10 @@ gp_window_text <- function(w, s, now) {
 # "A new forecast will be made once Cameron rises above X cfs ..."
 trigger_sentence <- function(f) {
   if (is.null(f$trigger_cfs)) return("")
+  low_txt <- if (isTRUE(f$low_is_post)) "its low since the last peak" else "its recent low"
   why <- if (f$trigger_cfs > cam_min_peak) {
-    sprintf(" (%s cfs above its recent low of %s cfs)",
-            cam_min_rise, fmt_cfs(f$low_recent))
+    sprintf(" (%s cfs above %s of %s cfs)",
+            fmt_cfs(f$trigger_cfs - f$low_recent), low_txt, fmt_cfs(f$low_recent))
   } else ""
   sprintf("A new forecast will be made once Cameron rises above %s cfs%s.",
           fmt_cfs(f$trigger_cfs), why)
@@ -360,21 +396,24 @@ interpretation <- function(summ, f) {
             level_phrase(gp$now_cfs))
   }
 
-  # 2. Upstream
-  up <- dplyr::filter(summ, Site %in% c("Winslow", "Moenkopi"), trend == "Rising")
-  s2 <- if (cam_rising) {
+  # 2. Upstream. Winslow water passes Cameron; Moenkopi water does not
+  # (Moenkopi Wash joins below Cameron), so it is never in the forecast.
+  win_up <- dplyr::filter(summ, Site == "Winslow",  trend == "Rising")
+  mk_up  <- dplyr::filter(summ, Site == "Moenkopi", trend == "Rising")
+  s2_main <- if (cam_rising) {
     sprintf("Cameron is rising (%s cfs); a forecast appears or updates as it peaks.",
             fmt_cfs(cam$now_cfs))
-  } else if (nrow(up) > 0L) {
-    many <- nrow(up) > 1L
-    sprintf("%s %s rising. %s not reached Cameron yet, so there is no forecast for %s.",
-            paste(sprintf("%s (%s cfs)", up$Site, fmt_cfs(up$now_cfs)), collapse = " and "),
-            if (many) "are" else "is",
-            if (many) "These have" else "It has",
-            if (many) "them" else "it")
-  } else {
+  } else if (nrow(win_up) == 1L) {
+    sprintf("Winslow is rising (%s cfs). It has not reached Cameron yet, so there is no forecast for it.",
+            fmt_cfs(win_up$now_cfs))
+  } else if (nrow(mk_up) == 0L) {
     "Nothing is rising upstream."
-  }
+  } else ""
+  s2_mk <- if (nrow(mk_up) == 1L) {
+    sprintf("Moenkopi is rising (%s cfs). Moenkopi Wash joins below Cameron, so this forecast does not cover it; watch the Gauge Pool directly.",
+            fmt_cfs(mk_up$now_cfs))
+  } else ""
+  s2 <- trimws(paste(s2_main, s2_mk))
 
   # 3. Forecast
   s3 <- switch(
@@ -430,8 +469,14 @@ about_forecast <- tags$details(
     "to estimate the chance the peak reaches the Gauge Pool and when."
   ),
   tags$p(sprintf(
-    "Trigger: Cameron must peak at %s cfs or more and rise at least %s cfs above its low in the prior %d h. Rises at Winslow or Moenkopi count only once they reach Cameron.",
-    cam_min_peak, cam_min_rise, lookback_h)),
+    "Trigger: Cameron must peak at %s cfs or more and rise above its low in the prior %d h by at least %s cfs or %d%% of that low, whichever is larger. A second pulse on the falling limb of an earlier flood counts as a new flood, measured from the low between them. Rises at Winslow count only once they reach Cameron.",
+    cam_min_peak, lookback_h, cam_min_rise, round(100 * cam_rel_rise))),
+  tags$p(
+    tags$strong("Moenkopi is not covered: "),
+    "Moenkopi Wash joins the river below Cameron, so its floods never pass the ",
+    "Cameron gauge. A Moenkopi flood can reach the Gauge Pool with no forecast on ",
+    "this page. When Moenkopi is rising, watch the Gauge Pool directly."
+  ),
   tags$p(
     "Reading it: 'Most likely' is the median predicted arrival; the likely window ",
     "holds the middle 80% of predicted times. Camp times are scaled from the Gauge ",
@@ -487,7 +532,8 @@ ui <- fluidPage(
              sprintf("Yes = reading within %d h; Delayed = older; No = no data.",
                      stale_hours)),
       tags$p(tags$strong("Forecast: "),
-             "starts from a Cameron peak. Upstream rises count only once they reach Cameron."),
+             "starts from a Cameron peak. Winslow rises count once they reach Cameron. ",
+             "Moenkopi joins below Cameron and is not forecast."),
       tags$p("Times are Arizona (MST).")
     ),
     mainPanel(
@@ -496,6 +542,7 @@ ui <- fluidPage(
       uiOutput("forecastPanel"),
       about_forecast,
       h3("Gauges, upstream to downstream"),
+      tags$p("Moenkopi Wash is a tributary that joins below Cameron."),
       tableOutput("gaugeTable"),
       h3(sprintf("Continuous discharge, last %d days", days_back)),
       plotlyOutput("hourlyDischargePlot"),
@@ -627,6 +674,10 @@ server <- function(input, output, session) {
         tableOutput("forecastTable"),
         tableOutput("campTable"),
         if (!is.na(f$extrap)) tags$p(tags$strong("Note: "), f$extrap),
+        if (any(summ()$Site == "Moenkopi" & summ()$trend == "Rising")) {
+          tags$p(tags$strong("Note: "),
+                 "Moenkopi is also rising. A Gauge Pool rise in the window may be Moenkopi water, not the Cameron flood.")
+        },
         if (f$out_of_season) {
           tags$p(tags$strong("Note: "), "outside the April to October fit season. Treat as a test.")
         }
