@@ -17,10 +17,14 @@
 #     Same logic as 14_live_forecast.R; shown only when Cameron has a flood;
 #     collapses to one line once the forecast window has passed.
 #  4. "About this forecast": static, collapsed methods note and disclaimer.
-#  5. Gauge table, upstream to downstream. Moenkopi Wash is a tributary that
-#     joins the LCR below Cameron, so it sits between Cameron and the Gauge
-#     Pool and its floods are NOT covered by the Cameron forecast.
+#  5. Gauge table, upstream to downstream. Winslow (mainstem) and Moenkopi
+#     Wash (tributary) are both upstream of the Cameron gauge, so water from
+#     either shows up at Cameron and then the Gauge Pool.
 #  6. Plots: continuous (with crew levels) and daily mean.
+#
+# 11/2/2026 (FWS correction): Moenkopi Wash joins the LCR ABOVE the Cameron
+# gauge, not below. Moenkopi floods pass Cameron and are covered by the
+# Cameron forecast once they arrive there, same as Winslow floods.
 #
 # 11/2/2026: a second Cameron pulse on the falling limb of an earlier flood
 # (2,715 cfs at 00:00, down to 607 at 09:00, back to 2,532 by 13:00) was
@@ -66,12 +70,13 @@ m <- readRDS("model_cam_gp.rds")
 ante_d <- if (is.null(m$ante_days)) 14 else m$ante_days
 
 # ---- Gauges (flow order), colors, line types -------------------------------
-# Winslow -> Cameron on the mainstem; Moenkopi Wash joins below Cameron.
+# Winslow (mainstem) and Moenkopi Wash (tributary) both enter above Cameron;
+# Cameron -> Gauge Pool on the mainstem.
 gauges <- data.frame(
   monitoring_location_id = paste0(
-    "USGS-", c("09400350", "09402000", "09401260", "09402300")
+    "USGS-", c("09400350", "09401260", "09402000", "09402300")
   ),
-  Site = c("Winslow", "Cameron", "Moenkopi", "LCR Gauge Pool"),
+  Site = c("Winslow", "Moenkopi", "Cameron", "LCR Gauge Pool"),
   stringsAsFactors = FALSE
 )
 
@@ -370,6 +375,11 @@ pending_sentence <- function(f) {
   } else trigger_sentence(f)
 }
 
+# Upstream gauges (both above Cameron) that are currently rising
+upstream_rising <- function(summ) {
+  dplyr::filter(summ, Site %in% c("Winslow", "Moenkopi"), trend == "Rising")
+}
+
 level_phrase <- function(q) {
   dplyr::case_when(
     q >= alert_cfs   ~ sprintf("ABOVE the %s cfs crew alert level", scales::comma(alert_cfs)),
@@ -396,24 +406,22 @@ interpretation <- function(summ, f) {
             level_phrase(gp$now_cfs))
   }
 
-  # 2. Upstream. Winslow water passes Cameron; Moenkopi water does not
-  # (Moenkopi Wash joins below Cameron), so it is never in the forecast.
-  win_up <- dplyr::filter(summ, Site == "Winslow",  trend == "Rising")
-  mk_up  <- dplyr::filter(summ, Site == "Moenkopi", trend == "Rising")
-  s2_main <- if (cam_rising) {
-    sprintf("Cameron is rising (%s cfs); a forecast appears or updates as it peaks.",
-            fmt_cfs(cam$now_cfs))
-  } else if (nrow(win_up) == 1L) {
-    sprintf("Winslow is rising (%s cfs). It has not reached Cameron yet, so there is no forecast for it.",
-            fmt_cfs(win_up$now_cfs))
-  } else if (nrow(mk_up) == 0L) {
-    "Nothing is rising upstream."
-  } else ""
-  s2_mk <- if (nrow(mk_up) == 1L) {
-    sprintf("Moenkopi is rising (%s cfs). Moenkopi Wash joins below Cameron, so this forecast does not cover it; watch the Gauge Pool directly.",
-            fmt_cfs(mk_up$now_cfs))
-  } else ""
-  s2 <- trimws(paste(s2_main, s2_mk))
+  # 2. Upstream. Winslow and Moenkopi water both pass Cameron, so either one
+  # enters the forecast once it raises Cameron.
+  up <- upstream_rising(summ)
+  up_txt <- if (nrow(up) == 0L) "" else
+    sprintf("%s %s rising (%s). That water has not reached Cameron yet; if it raises Cameron enough, a forecast will follow.",
+            paste(up$Site, collapse = " and "),
+            if (nrow(up) == 1L) "is" else "are",
+            paste(sprintf("%s cfs", fmt_cfs(up$now_cfs)), collapse = " and "))
+  s2 <- if (cam_rising) {
+    trimws(paste(
+      sprintf("Cameron is rising (%s cfs); a forecast appears or updates as it peaks.",
+              fmt_cfs(cam$now_cfs)),
+      up_txt))
+  } else if (nrow(up) > 0L) {
+    up_txt
+  } else "Nothing is rising upstream."
 
   # 3. Forecast
   s3 <- switch(
@@ -469,13 +477,16 @@ about_forecast <- tags$details(
     "to estimate the chance the peak reaches the Gauge Pool and when."
   ),
   tags$p(sprintf(
-    "Trigger: Cameron must peak at %s cfs or more and rise above its low in the prior %d h by at least %s cfs or %d%% of that low, whichever is larger. A second pulse on the falling limb of an earlier flood counts as a new flood, measured from the low between them. Rises at Winslow count only once they reach Cameron.",
+    "Trigger: Cameron must peak at %s cfs or more and rise above its low in the prior %d h by at least %s cfs or %d%% of that low, whichever is larger. A second pulse on the falling limb of an earlier flood counts as a new flood, measured from the low between them. Rises at Winslow or Moenkopi count only once they reach Cameron.",
     cam_min_peak, lookback_h, cam_min_rise, round(100 * cam_rel_rise))),
   tags$p(
-    tags$strong("Moenkopi is not covered: "),
-    "Moenkopi Wash joins the river below Cameron, so its floods never pass the ",
-    "Cameron gauge. A Moenkopi flood can reach the Gauge Pool with no forecast on ",
-    "this page. When Moenkopi is rising, watch the Gauge Pool directly."
+    tags$strong("Upstream gauges: "),
+    "Winslow (mainstem) and Moenkopi Wash (tributary) both join above the Cameron ",
+    "gauge, so their floods pass Cameron before the Gauge Pool. The forecast starts ",
+    "when that water raises Cameron, not when it is first seen upstream, so a rise ",
+    "at Winslow or Moenkopi is an early heads-up with no forecast attached yet. ",
+    "When everything else is low, Moenkopi water can be followed from Moenkopi to ",
+    "Cameron to the Gauge Pool on the plots below."
   ),
   tags$p(
     "Reading it: 'Most likely' is the median predicted arrival; the likely window ",
@@ -532,8 +543,8 @@ ui <- fluidPage(
              sprintf("Yes = reading within %d h; Delayed = older; No = no data.",
                      stale_hours)),
       tags$p(tags$strong("Forecast: "),
-             "starts from a Cameron peak. Winslow rises count once they reach Cameron. ",
-             "Moenkopi joins below Cameron and is not forecast."),
+             "starts from a Cameron peak. Winslow and Moenkopi are both upstream of ",
+             "Cameron; their rises count once they reach Cameron."),
       tags$p("Times are Arizona (MST).")
     ),
     mainPanel(
@@ -542,7 +553,7 @@ ui <- fluidPage(
       uiOutput("forecastPanel"),
       about_forecast,
       h3("Gauges, upstream to downstream"),
-      tags$p("Moenkopi Wash is a tributary that joins below Cameron."),
+      tags$p("Winslow (mainstem) and Moenkopi Wash (tributary) both join above Cameron."),
       tableOutput("gaugeTable"),
       h3(sprintf("Continuous discharge, last %d days", days_back)),
       plotlyOutput("hourlyDischargePlot"),
@@ -674,9 +685,14 @@ server <- function(input, output, session) {
         tableOutput("forecastTable"),
         tableOutput("campTable"),
         if (!is.na(f$extrap)) tags$p(tags$strong("Note: "), f$extrap),
-        if (any(summ()$Site == "Moenkopi" & summ()$trend == "Rising")) {
-          tags$p(tags$strong("Note: "),
-                 "Moenkopi is also rising. A Gauge Pool rise in the window may be Moenkopi water, not the Cameron flood.")
+        {
+          up <- upstream_rising(summ())
+          if (nrow(up) > 0L) {
+            tags$p(tags$strong("Note: "),
+                   sprintf("%s %s also rising upstream. That water is not in this forecast yet; it will show as a new Cameron rise when it arrives.",
+                           paste(up$Site, collapse = " and "),
+                           if (nrow(up) == 1L) "is" else "are"))
+          }
         },
         if (f$out_of_season) {
           tags$p(tags$strong("Note: "), "outside the April to October fit season. Treat as a test.")
