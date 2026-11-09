@@ -90,6 +90,30 @@
 #  - Sustained crew message ends with when Cameron's newest hour reaches the
 #    Gage Pool (model travel time), e.g. "At GP ~10:15.", instead of "GP
 #    stays high while Cameron holds."
+#
+# 11/9/2026 (text cleanup after the 11/8 Cameron crest; crew message unchanged):
+#  - Window passed: "What this means" no longer says the flood "has passed"
+#    with "no distinct rise". The Gage Pool was already ~7,500 cfs when the
+#    window opened and peaked at 8,165 cfs at Sun 21:00, 2 h after the window
+#    closed. The one-line forecast block now gives the highest Gage Pool flow
+#    since the window opened and when, relative to the window
+#    (gp_since_text). "What this means" covers Cameron now, how long the Gage
+#    Pool stays high, and what starts a new forecast.
+#  - Window passed: no "clears from the page at" sentence, and the new-
+#    forecast rule is stated as a rise from the low since the crest
+#    (rerise_sentence), not a fixed cfs that sat above the crest on a
+#    recession. The fixed-cfs trigger_sentence still runs when there is no
+#    current flood.
+#  - Stay-high estimate for crested floods with the Gage Pool above 600
+#    (stay_high_sentence): hours for Cameron to fall to the level that puts
+#    the Gage Pool at 3,000 (or 600), at Cameron's 6-h rate of fall, scaled
+#    by the current Gage Pool / Cameron ratio, plus model travel time. A
+#    straight-line recession at today's rate is a lower bound ("at least").
+#  - Upstream peaks older than the gage's longest travel time to Cameron
+#    (max_lag_h in upstream_flag) are reported as having had time to reach
+#    Cameron. The Wed 11/4 Winslow plateau was still written as on its way
+#    on Mon 11/9.
+#  - Trigger sentence (no-flood state) names the low it is measured from.
 
 library(shiny)
 library(dataRetrieval)
@@ -146,10 +170,12 @@ rise_needed <- function(q) pmax(cam_min_rise, cam_rel_rise * q)
 # look_h hours reached flag_cfs. look_h covers the pairing window to Cameron
 # (00_setup.R pathways). flag_cfs is PROVISIONAL: which Winslow floods reach
 # Cameron depends on channel wetness; to be set from the model.
+# max_lag_h: longest usual travel time to Cameron (upper end of lag_txt).
+# A peak older than this has had time to reach Cameron.
 upstream_flag <- tibble::tribble(
-  ~Site,      ~flag_cfs, ~look_h, ~lag_txt,
-  "Winslow",  1000,      120,     "35 to 90 h (1.5 to 4 days)",
-  "Moenkopi", 500,       48,      "3 to 48 h (typically about 11 h)"
+  ~Site,      ~flag_cfs, ~look_h, ~max_lag_h, ~lag_txt,
+  "Winslow",  1000,      120,     90,         "35 to 90 h (1.5 to 4 days)",
+  "Moenkopi", 500,       48,      48,         "3 to 48 h (typically about 11 h)"
 )
 
 tz_az <- "US/Arizona"
@@ -471,6 +497,12 @@ run_forecast <- function(continuous, now) {
   gp_win <- if (is.na(s$arrive_early)) gp[0, ] else {
     dplyr::filter(gp, time >= s$arrive_early, time <= s$arrive_late)
   }
+  # Gage Pool from the window opening to now (hourly means). Used once the
+  # window has passed: a broad flood can peak at the Gage Pool after the
+  # window closes (11/8/2026: window 15:00-19:00, peak 8,165 cfs at 21:00).
+  gp_since <- if (is.na(s$arrive_early)) gp[0, ] else {
+    dplyr::filter(gp, time >= s$arrive_early)
+  }
 
   c(out, list(
     status        = if (out$sustained) "sustained" else "forecast",
@@ -478,6 +510,7 @@ run_forecast <- function(continuous, now) {
     s             = s,
     cf            = camp_forecast(m, fc, pk$time),
     gp_win        = gp_win,
+    gp_since      = gp_since,
     extrap        = extrapolation_note(m, pk$flow),
     out_of_season = !lubridate::month(pk$time) %in% season_months
   ))
@@ -511,13 +544,76 @@ gp_window_text <- function(w, s, now) {
 # "A new forecast will be made once Cameron rises above X cfs ..."
 trigger_sentence <- function(f) {
   if (is.null(f$trigger_cfs)) return("")
-  low_txt <- if (isTRUE(f$low_is_post)) "its low since the last peak" else "its recent low"
+  low_txt <- if (isTRUE(f$low_is_post)) "Cameron's low since the last peak" else "Cameron's recent low"
   why <- if (f$trigger_cfs > cam_min_peak) {
-    sprintf(" (%s cfs above %s of %s cfs)",
+    sprintf(" (%s cfs above %s, %s cfs)",
             fmt_cfs(f$trigger_cfs - f$low_recent), low_txt, fmt_cfs(f$low_recent))
   } else ""
   sprintf("A new forecast will be made once Cameron rises above %s cfs%s.",
           fmt_cfs(f$trigger_cfs), why)
+}
+
+# Window passed: highest Gage Pool flow (hourly mean) since the window
+# opened, and whether it came inside or after the window. Replaces "No rise"
+# / "no distinct rise", which read as nothing happening when the Gage Pool
+# was already high and peaked after the window (11/8/2026).
+gp_since_text <- function(f) {
+  g <- f$gp_since
+  if (is.null(g) || nrow(g) == 0L) {
+    return("There are no Gage Pool readings since the forecast window opened.")
+  }
+  first <- g[1, ]
+  top   <- dplyr::slice_max(g, flow, n = 1, with_ties = FALSE)
+  if (top$time == first$time) {
+    return(sprintf("The Gage Pool has not risen since the forecast window opened (%s cfs at %s).",
+                   fmt_cfs(first$flow), fmt_t(first$time)))
+  }
+  when <- if (top$time > f$s$arrive_late) {
+    sprintf(", %.0f h after it closed", as.numeric(difftime(top$time, f$s$arrive_late, units = "hours")))
+  } else ", inside the window"
+  sprintf("Highest Gage Pool flow since the window opened: %s cfs at %s%s.",
+          fmt_cfs(top$flow), fmt_t(top$time), when)
+}
+
+# "Sun 11/08/2026 15:00 to 19:00"; full date on the end only when it differs
+fmt_span <- function(a, b) {
+  same_day <- as.Date(a, tz = tz_az) == as.Date(b, tz = tz_az)
+  sprintf("%s to %s", fmt_t(a),
+          if (isTRUE(same_day)) format(b, "%H:%M", tz = tz_az) else fmt_t(b))
+}
+
+# Window passed: what would start a new forecast. On a recession the low
+# since the crest is about the current flow and keeps dropping, so a fixed
+# cfs trigger reads as Cameron going back up to a number it just left
+# (11/9/2026: "rises above 10,574 cfs ... low of 9,612"). State the rule.
+rerise_sentence <- function(f) {
+  if (is.null(f$low_recent) || is.na(f$low_recent)) return("")
+  amt <- if (rise_needed(f$low_recent) > cam_min_rise) {
+    sprintf("%d%%", round(100 * cam_rel_rise))
+  } else sprintf("%s cfs", fmt_cfs(cam_min_rise))
+  sprintf("A new forecast starts if Cameron rises again by %s or more from its lowest flow since the %s.",
+          amt, if (isTRUE(f$crested)) "crest" else "peak")
+}
+
+# Crested flood, Gage Pool still above 600: how long it stays above the
+# crew level it is over (3,000 if above it, else 600). The Gage Pool reaches
+# that level when Cameron falls to level x Cameron / Gage Pool (today's
+# ratio), about one travel time later. Hours to get there use Cameron's
+# 6-h rate of fall as a straight line; recessions slow down, so this is a
+# lower bound ("at least"). Blank for pulses, rising Cameron, or under 12 h.
+stay_high_sentence <- function(f) {
+  gp <- f$gp_now
+  if (!isTRUE(f$crested) || !isTRUE(f$cam_change < 0) || !isTRUE(gp > no_cross_cfs)) return("")
+  level   <- if (gp >= alert_cfs) alert_cfs else no_cross_cfs
+  rate    <- -f$cam_change / sustained_look_h               # cfs per hour
+  cam_for <- level * f$cam_now / gp
+  h <- (f$cam_now - cam_for) / rate + dplyr::coalesce(f$s$lag_mid_h, 0)
+  if (!is.finite(h) || h < 12) return("")
+  dur <- if (h >= 36) {
+    sprintf("at least %s days", format(floor(h / 12) / 2))
+  } else sprintf("at least %.0f h", 12 * floor(h / 12))
+  sprintf("At Cameron's current rate of fall, the Gage Pool is likely to stay above %s cfs for %s, and longer if Cameron's fall slows, as recessions usually do.",
+          scales::comma(level), dur)
 }
 
 # Sustained-state helpers
@@ -567,7 +663,7 @@ upstream_active <- function(continuous, summ) {
   if (nrow(continuous) == 0L || nrow(summ) == 0L) {
     return(tibble::tibble(Site = character(), peak_cfs = numeric(),
                           peak_time = as.POSIXct(character(), tz = tz_az),
-                          flag_cfs = numeric(), lag_txt = character(),
+                          flag_cfs = numeric(), max_lag_h = numeric(), lag_txt = character(),
                           now_cfs = numeric(), trend = character(),
                           last_time = as.POSIXct(character(), tz = tz_az)))
   }
@@ -584,6 +680,7 @@ upstream_active <- function(continuous, summ) {
                      near_to   = max(time[flow >= plateau_frac * max(flow)]),
                      last_hour = max(time),
                      flag_cfs  = dplyr::first(flag_cfs),
+                     max_lag_h = dplyr::first(max_lag_h),
                      lag_txt   = dplyr::first(lag_txt),
                      .groups   = "drop") %>%
     dplyr::mutate(plateau = as.numeric(difftime(near_to, near_from, units = "hours")) >= plateau_h,
@@ -601,11 +698,24 @@ upstream_sentence <- function(up) {
   if (nrow(up) == 0L) return("")
   # Peaks are hourly means. A long, flat top (plateau) is described by its
   # span, because the single highest hour on it is arbitrary.
-  up %>%
+  # reached: the peak (end of a plateau) left this gage more than max_lag_h
+  # ago, so that water has had time to reach Cameron (11/9/2026: the Wed
+  # 11/4 Winslow plateau was still written as on its way on Mon 11/9).
+  up <- up %>%
     dplyr::mutate(
       at_peak   = as.numeric(difftime(last_time, peak_time, units = "hours")) <= 1,
       trend_txt = dplyr::if_else(trend == "-", "trend unknown", tolower(trend)),
+      top_end   = dplyr::if_else(plateau, near_to, peak_time),
+      reached   = !at_peak &
+        as.numeric(difftime(last_time, top_end, units = "hours")) > max_lag_h,
+      peak_txt  = dplyr::if_else(
+        plateau,
+        sprintf("about %s cfs, %s to %s", fmt_cfs(peak_cfs), fmt_t(near_from), fmt_t(near_to)),
+        sprintf("%s cfs, %s", fmt_cfs(peak_cfs), fmt_t(peak_time))),
       txt = dplyr::case_when(
+        reached ~
+          sprintf("%s water usually takes %s to reach Cameron, so the %s flood (%s) has had time to get there. %s is now %s cfs, %s.",
+                  Site, lag_txt, Site, peak_txt, Site, fmt_cfs(now_cfs), trend_txt),
         at_peak & is_rising(trend) ~
           sprintf("%s is %s (%s cfs).", Site, tolower(trend), fmt_cfs(now_cfs)),
         on_plateau_now ~
@@ -618,14 +728,16 @@ upstream_sentence <- function(up) {
         TRUE ~
           sprintf("%s peaked at %s cfs (%s) and is now %s cfs, %s.",
                   Site, fmt_cfs(peak_cfs), fmt_t(peak_time), fmt_cfs(now_cfs), trend_txt)),
-      txt = paste(txt, dplyr::if_else(
-        plateau,
-        sprintf("%s water usually takes %s to reach Cameron, so Cameron can stay high long after the %s peak.",
-                Site, lag_txt, Site),
-        sprintf("%s water usually peaks at Cameron %s after the %s peak.",
-                Site, lag_txt, Site)))) %>%
-    dplyr::pull(txt) %>%
-    c("Upstream water enters the forecast once it reaches Cameron.") %>%
+      txt = dplyr::case_when(
+        reached ~ txt,
+        plateau ~ paste(txt, sprintf(
+          "%s water usually takes %s to reach Cameron, so Cameron can stay high long after the %s peak.",
+          Site, lag_txt, Site)),
+        TRUE ~ paste(txt, sprintf(
+          "%s water usually peaks at Cameron %s after the %s peak.",
+          Site, lag_txt, Site))))
+  c(up$txt,
+    if (any(!up$reached)) "Upstream water enters the forecast once it reaches Cameron.") %>%
     paste(collapse = " ")
 }
 
@@ -738,23 +850,17 @@ interpretation <- function(summ, f, up) {
         sprintf("%s is unlikely to reach the Gage Pool as a distinct peak (%d%% chance).",
                 cf, round(100 * s$p_arrive))
       } else if (f$now > s$arrive_late) {
-        res <- if (nrow(f$gp_win) == 0L) {
-          "there were no Gage Pool readings in its window"
-        } else {
-          g <- gp_window_check(f$gp_win)
-          if (g$rose) sprintf("the Gage Pool rose to %s cfs at %s",
-                              fmt_cfs(g$top$flow), fmt_t(g$top$time))
-          else "the Gage Pool showed no distinct rise in its window"
-        }
-        paste0(
-          sprintf("%s has passed: its forecast window closed %s, and %s.",
-                  cf, fmt_t(s$arrive_late), res),
-          if (isTRUE(f$crested)) {
-            sprintf(" Cameron crested broadly and is falling slowly (now %s cfs, %s cfs in the last %d h), so the Gage Pool can stay high well after the forecast window.",
-                    fmt_cfs(f$cam_now), signed_cfs(f$cam_change), sustained_look_h)
-          } else "",
-          sprintf(" It clears from this page at %s; after that, %s",
-                  fmt_t(f$clears_at), sub("^A new", "a new", trigger_sentence(f))))
+        # Window passed. Say what Cameron and the Gage Pool are doing, not
+        # that the flood "has passed" (11/9/2026: Cameron was still at 92%
+        # of its crest and the Gage Pool more than twice the alert level).
+        cam_txt <- if (nrow(cam) == 1L) cam$now_cfs else f$cam_now
+        trimws(paste(
+          sprintf("Cameron %s %s cfs (%s) and is now %s cfs (%s cfs in the last %d h).",
+                  if (isTRUE(f$crested)) "crested at" else "peaked at",
+                  fmt_cfs(f$pk$flow), fmt_t(f$pk$time), fmt_cfs(cam_txt),
+                  signed_cfs(f$cam_change), sustained_look_h),
+          stay_high_sentence(f),
+          rerise_sentence(f)))
       } else {
         when <- if (f$now >= s$arrive_early) "should be peaking at the Gage Pool now" else
           sprintf("is forecast to peak at the Gage Pool around %s", fmt_t(s$arrive_mid))
@@ -1021,10 +1127,10 @@ server <- function(input, output, session) {
         fmt_t(f$pk$time))),
       # Window already closed: one line instead of full tables
       forecast = if (!is.na(f$s$arrive_late) && f$now > f$s$arrive_late) {
-        tags$p(sprintf("Last forecast (Cameron %s %s cfs at %s): window closed %s. %s.",
-                       if (isTRUE(f$crested)) "crested at" else "peak",
-                       fmt_cfs(f$pk$flow), fmt_t(f$pk$time), fmt_t(f$s$arrive_late),
-                       gp_window_text(f$gp_win, f$s, f$now)))
+        tags$p(sprintf("Last forecast, from the Cameron %s of %s cfs at %s: Gage Pool peak expected %s. %s",
+                       if (isTRUE(f$crested)) "crest" else "peak",
+                       fmt_cfs(f$pk$flow), fmt_t(f$pk$time),
+                       fmt_span(f$s$arrive_early, f$s$arrive_late), gp_since_text(f)))
       } else tagList(
         tags$p(tags$strong(sprintf("From the Cameron peak: %s cfs at %s (%.0f h ago).",
                                    fmt_cfs(f$pk$flow), fmt_t(f$pk$time), f$pk_age_h)),

@@ -1,1 +1,0 @@
-API_USGS_PAT=MwpJRrwBgdpPDMHwWLG7GzfNwfcbDQMzzm7fHcBw
