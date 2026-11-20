@@ -114,6 +114,13 @@
 #    Cameron. The Wed 11/4 Winslow plateau was still written as on its way
 #    on Mon 11/9.
 #  - Trigger sentence (no-flood state) names the low it is measured from.
+#
+# 11/19/2026 (matches 14_live_forecast.R): recession at the window edge.
+# Once a crest left the 48-h window, the highest hour left on the recession
+# was the window's first hour and was called a new peak (11/11: "Cameron
+# peaked 9,612 cfs", an hour on the 11/8 recession). A window max with an
+# equal or higher hour just before it is "receding": no flood. The page and
+# crew message say Cameron is falling from an earlier flood.
 
 library(shiny)
 library(dataRetrieval)
@@ -375,6 +382,8 @@ hourly <- function(continuous, site) {
 #    on the falling limb (11/2/2026) and an old tail at the window edge
 #    masking a small new rise (11/1/2026).
 # 4. Otherwise the flood is pk_max, with base from walk_back_base().
+# 5. If pk_max has an equal or higher hour just before it, it is on the
+#    recession of a crest that has left the window: receding, no flood.
 
 # Base (start of the rise) for a peak: walk back in time from the peak and
 # stop where flow climbs back up by rise_needed() above the lowest flow seen
@@ -393,6 +402,17 @@ walk_back_base <- function(cam, pk_time) {
     dplyr::slice_min(flow, n = 1, with_ties = TRUE) %>%
     dplyr::slice_max(time, n = 1, with_ties = FALSE) %>%
     dplyr::select(time, flow)
+}
+
+# TRUE when the hour just before t (within 3 h) is at or above Cameron at t:
+# t is on a recession, not a peak. Only the first hour of the event window
+# can pass, because the hour before it is outside the window.
+falling_into <- function(cam, t) {
+  at   <- cam$flow[cam$time == t]
+  prev <- cam %>%
+    dplyr::filter(time < t, time >= t - 3 * 3600) %>%
+    dplyr::slice_max(time, n = 1, with_ties = FALSE)
+  length(at) == 1L && nrow(prev) == 1L && prev$flow >= at
 }
 
 find_cam_flood <- function(cam, last_t) {
@@ -417,13 +437,16 @@ find_cam_flood <- function(cam, last_t) {
   pk   <- if (new_flood) pk_new else pk_max
   base <- if (new_flood) trough else walk_back_base(cam, pk$time)
 
+  # 5. Window max on a recession (its crest has left the window): not a flood
+  receding <- !new_flood && falling_into(cam, pk$time)
+
   # Low a future rise would be measured from: the post-peak trough when
   # there is one, else the plain recent low.
   post_low <- nrow(trough) == 1L
   low_ref  <- if (post_low) trough$flow else
     min(cam$flow[cam$time > last_t - lookback_h * 3600])
 
-  list(pk = pk, base = base, low_ref = low_ref, post_low = post_low)
+  list(pk = pk, base = base, low_ref = low_ref, post_low = post_low, receding = receding)
 }
 
 run_forecast <- function(continuous, now) {
@@ -449,11 +472,8 @@ run_forecast <- function(continuous, now) {
               clears_at   = pk$time + event_h * 3600,   # old peak leaves the search window
               low_recent  = ev$low_ref,
               low_is_post = ev$post_low,
-              trigger_cfs = max(cam_min_peak, ev$low_ref + rise_needed(ev$low_ref)))
-
-  has_flood <- pk$flow >= cam_min_peak &&
-    pk$flow - base$flow >= rise_needed(base$flow)
-  if (!has_flood) return(c(out, status = "no_flood"))
+              trigger_cfs = max(cam_min_peak, ev$low_ref + rise_needed(ev$low_ref)),
+              receding    = ev$receding)
 
   cam_at <- function(t) {
     v <- cam$flow[cam$time == t]
@@ -461,6 +481,10 @@ run_forecast <- function(continuous, now) {
   }
   look           <- sustained_look_h * 3600
   out$cam_change <- cam_now - cam_at(last_t - look)
+
+  has_flood <- !ev$receding && pk$flow >= cam_min_peak &&
+    pk$flow - base$flow >= rise_needed(base$flow)
+  if (!has_flood) return(c(out, status = "no_flood"))
 
   # Peaked: below 80% of the max (pulses), or crested: max at least crest_h
   # old, now at or below crest_drop of it, and falling (broad Winslow floods
@@ -539,6 +563,13 @@ gp_window_text <- function(w, s, now) {
     sprintf("%sNo rise (%s to %s cfs)",
             so_far, fmt_cfs(g$start$flow), fmt_cfs(g$last$flow))
   }
+}
+
+# Cameron falling from a crest that has left the event window (11/19/2026)
+receding_sentence <- function(f) {
+  if (!isTRUE(f$receding)) return("")
+  sprintf("Cameron is %s cfs and falling from a flood that peaked more than %d h ago, longer than its usual travel time to the Gage Pool, so no forecast is shown.",
+          fmt_cfs(f$cam_now), event_h)
 }
 
 # "A new forecast will be made once Cameron rises above X cfs ..."
@@ -784,6 +815,10 @@ crew_inreach <- function(summ, f, up, max_chars = 160) {
     sprintf("Cameron %s %s cfs %s, now %s cfs (%s in %dh).",
             if (isTRUE(f$crested)) "crested" else "peaked", fmt_cfs(f$pk$flow),
             dhm(f$pk$time), fmt_cfs(f$cam_now), signed_cfs(f$cam_change), sustained_look_h)
+  } else if (isTRUE(f$receding)) {
+    if ("Winslow" %in% up$Site) extra <- "Winslow still high."
+    sprintf("Cameron %s cfs, falling (%s in %dh). No new flood.",
+            fmt_cfs(f$cam_now), signed_cfs(f$cam_change), sustained_look_h)
   } else if (nrow(up) > 0L) {
     sprintf("%s high upstream, watch Cameron.", paste(up$Site, collapse = " and "))
   } else "Nothing high upstream."
@@ -836,7 +871,8 @@ interpretation <- function(summ, f, up) {
   s3 <- switch(
     f$status,
     no_data  = "Cameron is not reporting, so no forecast is possible.",
-    no_flood = paste("There is no Cameron flood forecast yet.",
+    no_flood = paste(if (isTRUE(f$receding)) receding_sentence(f) else
+                       "There is no Cameron flood forecast yet.",
                      pending_sentence(f)),
     patchy   = "A recent Cameron flood could not be forecast because of missing readings.",
     sustained = sprintf(
@@ -890,8 +926,8 @@ about_forecast <- tags$details(
     "to estimate the chance the peak reaches the Gage Pool and when."
   ),
   tags$p(sprintf(
-    "Trigger: Cameron must peak at %s cfs or more and rise above its low in the prior %d h by at least %s cfs or %d%% of that low, whichever is larger. A second pulse on the falling limb of an earlier flood counts as a new flood, measured from the low between them. Rises at Winslow or Moenkopi count only once they reach Cameron.",
-    cam_min_peak, lookback_h, cam_min_rise, round(100 * cam_rel_rise))),
+    "Trigger: Cameron must peak at %s cfs or more and rise above its low in the prior %d h by at least %s cfs or %d%% of that low, whichever is larger. A second pulse on the falling limb of an earlier flood counts as a new flood, measured from the low between them. Rises at Winslow or Moenkopi count only once they reach Cameron. Once a Cameron peak is more than %d h old, the page reports Cameron as falling and shows no forecast.",
+    cam_min_peak, lookback_h, cam_min_rise, round(100 * cam_rel_rise), event_h)),
   tags$p(
     tags$strong("Upstream gages: "),
     "Winslow (mainstem) and Moenkopi Wash (tributary) both join above the Cameron ",
@@ -1120,8 +1156,9 @@ server <- function(input, output, session) {
     body <- switch(
       f$status,
       no_data  = tags$p("No recent Cameron readings. No forecast."),
-      no_flood = tags$p(sprintf("No Cameron flood in the last %d h. %s",
-                                event_h, pending_sentence(f))),
+      no_flood = tags$p(if (isTRUE(f$receding)) {
+        paste(receding_sentence(f), pending_sentence(f))
+      } else sprintf("No Cameron flood in the last %d h. %s", event_h, pending_sentence(f))),
       patchy   = tags$p(sprintf(
         "Cameron flood at %s, but too many missing Cameron readings to forecast.",
         fmt_t(f$pk$time))),
